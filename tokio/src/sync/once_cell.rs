@@ -221,6 +221,34 @@ impl<T> OnceCell<T> {
         unsafe { self.get_unchecked() }
     }
 
+    /// Returns a reference to the value currently stored in the `OnceCell`,
+    /// waiting until the `OnceCell` is set if it is empty.
+    ///
+    /// This function is cancellation-safe.
+    pub async fn wait(&self) -> &T {
+        if self.initialized() {
+            // SAFETY: The OnceCell has been fully initialized.
+            unsafe { self.get_unchecked() }
+        } else {
+            // Here we try to acquire two semaphore permits.
+            // This will always fail, because the semaphore only has one permit.
+            // Therefore, the only way this call completes is when the semaphore is closed,
+            // which indicates that the semaphore is initialized.
+            match self.semaphore.acquire_many(2).await {
+                Ok(_) => {
+                    unreachable!("semaphore only has one permit")
+                }
+                Err(_) => {
+                    debug_assert!(self.initialized());
+
+                    // SAFETY: The semaphore has been closed. This only happens
+                    // when the OnceCell is fully initialized.
+                    unsafe { self.get_unchecked() }
+                }
+            }
+        }
+    }
+
     /// Returns a reference to the value currently stored in the `OnceCell`, or
     /// `None` if the `OnceCell` is empty.
     pub fn get(&self) -> Option<&T> {
