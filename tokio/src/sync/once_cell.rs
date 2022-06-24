@@ -1,4 +1,4 @@
-use super::{Semaphore, SemaphorePermit, TryAcquireError};
+use super::{Semaphore, SemaphorePermit, TryAcquireError, Notify};
 use crate::loom::cell::UnsafeCell;
 use std::error::Error;
 use std::fmt;
@@ -71,6 +71,7 @@ pub struct OnceCell<T> {
     value_set: AtomicBool,
     value: UnsafeCell<MaybeUninit<T>>,
     semaphore: Semaphore,
+    wait_notify: Notify,
 }
 
 impl<T> Default for OnceCell<T> {
@@ -120,6 +121,7 @@ impl<T> From<T> for OnceCell<T> {
             value_set: AtomicBool::new(true),
             value: UnsafeCell::new(MaybeUninit::new(value)),
             semaphore,
+            wait_notify: Notify::new(),
         }
     }
 }
@@ -131,6 +133,7 @@ impl<T> OnceCell<T> {
             value_set: AtomicBool::new(false),
             value: UnsafeCell::new(MaybeUninit::uninit()),
             semaphore: Semaphore::new(1),
+            wait_notify: Notify::new(),
         }
     }
 
@@ -178,6 +181,7 @@ impl<T> OnceCell<T> {
             value_set: AtomicBool::new(false),
             value: UnsafeCell::new(MaybeUninit::uninit()),
             semaphore: Semaphore::const_new(1),
+            wait_notify: Notify::const_new(),
         }
     }
 
@@ -214,11 +218,32 @@ impl<T> OnceCell<T> {
         // Using release ordering so any threads that read a true from this
         // atomic is able to read the value we just stored.
         self.value_set.store(true, Ordering::Release);
+
+        // Wake all waiting tasks
+        self.wait_notify.notify_waiters();
         self.semaphore.close();
         permit.forget();
 
         // SAFETY: We just initialized the cell.
         unsafe { self.get_unchecked() }
+    }
+
+    /// Returns a reference to the value currently stored in the `OnceCell`,
+    /// waiting until the `OnceCell` is set if it is empty.
+    ///
+    /// This function is cancellation-safe.
+    pub async fn wait(&self) -> &T {
+        if self.initialized() {
+            unsafe { self.get_unchecked() }
+        } else {
+            self.wait_notify.notified().await;
+
+            debug_assert!(self.initialized());
+
+            // SAFETY: wait_notify was notified. This only happens
+            // when the OnceCell is fully initialized.
+            unsafe { self.get_unchecked() }
+        }
     }
 
     /// Returns a reference to the value currently stored in the `OnceCell`, or
