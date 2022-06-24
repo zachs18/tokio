@@ -71,6 +71,7 @@ pub struct OnceCell<T> {
     value_set: AtomicBool,
     value: UnsafeCell<MaybeUninit<T>>,
     semaphore: Semaphore,
+    wait_semaphore: Semaphore,
 }
 
 impl<T> Default for OnceCell<T> {
@@ -116,10 +117,13 @@ impl<T> From<T> for OnceCell<T> {
     fn from(value: T) -> Self {
         let semaphore = Semaphore::new(0);
         semaphore.close();
+        let wait_semaphore = Semaphore::new(0);
+        wait_semaphore.close();
         OnceCell {
             value_set: AtomicBool::new(true),
             value: UnsafeCell::new(MaybeUninit::new(value)),
             semaphore,
+            wait_semaphore,
         }
     }
 }
@@ -131,6 +135,7 @@ impl<T> OnceCell<T> {
             value_set: AtomicBool::new(false),
             value: UnsafeCell::new(MaybeUninit::uninit()),
             semaphore: Semaphore::new(1),
+            wait_semaphore: Semaphore::new(0),
         }
     }
 
@@ -178,6 +183,7 @@ impl<T> OnceCell<T> {
             value_set: AtomicBool::new(false),
             value: UnsafeCell::new(MaybeUninit::uninit()),
             semaphore: Semaphore::const_new(1),
+            wait_semaphore: Semaphore::const_new(0),
         }
     }
 
@@ -215,10 +221,39 @@ impl<T> OnceCell<T> {
         // atomic is able to read the value we just stored.
         self.value_set.store(true, Ordering::Release);
         self.semaphore.close();
+        self.wait_semaphore.close();
         permit.forget();
 
         // SAFETY: We just initialized the cell.
         unsafe { self.get_unchecked() }
+    }
+
+    /// Returns a reference to the value currently stored in the `OnceCell`,
+    /// waiting until the `OnceCell` is set if it is empty.
+    ///
+    /// This function is cancellation-safe.
+    pub async fn wait(&self) -> &T {
+        if self.initialized() {
+            // SAFETY: The OnceCell has been fully initialized.
+            unsafe { self.get_unchecked() }
+        } else {
+            // Here we try to acquire a wait_semaphore permit.
+            // This will always fail, because the wait_semaphore has no permits.
+            // Therefore, the only way this call completes is when the wait_semaphore is closed,
+            // which indicates that the OnceCell is initialized.
+            match self.wait_semaphore.acquire().await {
+                Ok(_) => {
+                    unreachable!("wait_semaphore has no permits")
+                }
+                Err(_) => {
+                    debug_assert!(self.initialized());
+
+                    // SAFETY: The wait_semaphore has been closed. This only happens
+                    // when the OnceCell is fully initialized.
+                    unsafe { self.get_unchecked() }
+                }
+            }
+        }
     }
 
     /// Returns a reference to the value currently stored in the `OnceCell`, or
