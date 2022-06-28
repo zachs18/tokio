@@ -1,5 +1,5 @@
 use super::{Semaphore, SemaphorePermit, TryAcquireError, Notify};
-use crate::loom::cell::UnsafeCell;
+use crate::loom::{sync::Arc, cell::UnsafeCell};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -71,7 +71,7 @@ pub struct OnceCell<T> {
     value_set: AtomicBool,
     value: UnsafeCell<MaybeUninit<T>>,
     semaphore: Semaphore,
-    wait_notify: Notify,
+    wait_notify: UnsafeCell<Option<Arc<Notify>>>,
 }
 
 impl<T> Default for OnceCell<T> {
@@ -121,7 +121,7 @@ impl<T> From<T> for OnceCell<T> {
             value_set: AtomicBool::new(true),
             value: UnsafeCell::new(MaybeUninit::new(value)),
             semaphore,
-            wait_notify: Notify::new(),
+            wait_notify: UnsafeCell::new(None),
         }
     }
 }
@@ -133,7 +133,7 @@ impl<T> OnceCell<T> {
             value_set: AtomicBool::new(false),
             value: UnsafeCell::new(MaybeUninit::uninit()),
             semaphore: Semaphore::new(1),
-            wait_notify: Notify::new(),
+            wait_notify: UnsafeCell::new(None),
         }
     }
 
@@ -181,7 +181,7 @@ impl<T> OnceCell<T> {
             value_set: AtomicBool::new(false),
             value: UnsafeCell::new(MaybeUninit::uninit()),
             semaphore: Semaphore::const_new(1),
-            wait_notify: Notify::const_new(),
+            wait_notify: UnsafeCell::new(None),
         }
     }
 
@@ -219,8 +219,15 @@ impl<T> OnceCell<T> {
         // atomic is able to read the value we just stored.
         self.value_set.store(true, Ordering::Release);
 
-        // Wake all waiting tasks
-        self.wait_notify.notify_waiters();
+        // Wake all waiting tasks, and release the Notify.
+        // SAFETY: We are holding the only permit on the semaphore.
+        unsafe {
+            self.wait_notify.with_mut(|ptr| {
+                if let Some(wait_notify) = (*ptr).take() {
+                    wait_notify.notify_waiters();
+                }
+            });
+        }
         self.semaphore.close();
         permit.forget();
 
@@ -236,13 +243,48 @@ impl<T> OnceCell<T> {
         if self.initialized() {
             unsafe { self.get_unchecked() }
         } else {
-            self.wait_notify.notified().await;
+            // Here we try to acquire the semaphore permit. Holding the permit
+            // will allow us to initialize wait_notify, and prevents
+            // other tasks from initializing the OnceCell while we are holding
+            // it.
+            match self.semaphore.acquire().await {
+                Ok(permit) => {
+                    debug_assert!(!self.initialized());
 
-            debug_assert!(self.initialized());
+                    let wait_notify = unsafe {
+                        self.wait_notify.with_mut(|ptr| {
+                            match &mut *ptr {
+                                Some(wait_notify) => Arc::clone(&wait_notify),
+                                None => {
+                                    let wait_notify = Arc::new(Notify::new());
+                                    *ptr = Some(Arc::clone(&wait_notify));
+                                    wait_notify
+                                },
+                            }
+                        })
+                    };
 
-            // SAFETY: wait_notify was notified. This only happens
-            // when the OnceCell is fully initialized.
-            unsafe { self.get_unchecked() }
+                    // We must release the permit, else wait_notify.notified().await would deadlock.
+                    // SAFETY: We have an owned Arc separate from self.wait_notify,
+                    // so we may release the semaphore permit.
+                    drop(permit);
+
+                    wait_notify.notified().await;
+
+                    debug_assert!(self.initialized());
+
+                    // SAFETY: wait_notify was notified. This only happens
+                    // when the OnceCell is fully initialized.
+                    unsafe { self.get_unchecked() }
+                }
+                Err(_) => {
+                    debug_assert!(self.initialized());
+
+                    // SAFETY: The semaphore has been closed. This only happens
+                    // when the OnceCell is fully initialized.
+                    unsafe { self.get_unchecked() }
+                }
+            }
         }
     }
 
